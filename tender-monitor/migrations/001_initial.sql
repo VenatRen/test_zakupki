@@ -1,0 +1,2 @@
+-- Initial migration for tender monitoring system
+-- This file is for reference only, actual migrations handled by SQLAlchemy
