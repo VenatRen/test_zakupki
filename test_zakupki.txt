@@ -1,0 +1,2400 @@
+Да. Ниже фиксирую **финальный v1.0 как исходный проект**, который можно положить в репозиторий и разворачивать на VPS. Я также учёл важную практическую вещь: ФАБРИКАНТ публично показывает реестр 223-ФЗ и основные поля закупок, включая номер, НМЦ, заказчика, даты и статус; при этом на отдельных страницах у него действительно встречается ошибка динамической загрузки, поэтому адаптер должен уметь работать через HTML и не считать единичную ошибку страницы падением всей системы. ([Фабрикант][1])
+
+Я не буду выдавать вымышленные API-адреса ТЭК-Торг или РТС за реальные. Для них в проекте предусмотрены browser-adapters с отдельным healthcheck и конфигурацией URL/селекторов. Это безопаснее для production.
+
+## 1. Структура проекта
+
+```text id="41827"
+tender-monitor/
+├── .env.example
+├── .gitignore
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+├── README.md
+├── requirements.txt
+│
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── logging_config.py
+│   │
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── models.py
+│   │   ├── session.py
+│   │   └── repository.py
+│   │
+│   ├── collectors/
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── manager.py
+│   │   ├── eis.py
+│   │   ├── fabrikant.py
+│   │   ├── tektorg.py
+│   │   └── rts.py
+│   │
+│   ├── parsers/
+│   │   ├── __init__.py
+│   │   ├── common.py
+│   │   ├── fabrikant.py
+│   │   ├── tektorg.py
+│   │   └── rts.py
+│   │
+│   ├── filters/
+│   │   ├── __init__.py
+│   │   └── education.py
+│   │
+│   ├── documents/
+│   │   ├── __init__.py
+│   │   ├── downloader.py
+│   │   └── extractor.py
+│   │
+│   ├── notifications/
+│   │   ├── __init__.py
+│   │   └── telegram.py
+│   │
+│   ├── workers/
+│   │   ├── __init__.py
+│   │   └── tasks.py
+│   │
+│   └── api/
+│       ├── __init__.py
+│       ├── health.py
+│       └── tenders.py
+│
+├── migrations/
+│   └── 001_initial.sql
+│
+├── tests/
+│   ├── test_filter.py
+│   └── test_dedup.py
+│
+└── data/
+    └── documents/
+```
+
+---
+
+# 2. `docker-compose.yml`
+
+```yaml id="59301"
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tender-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: tender-redis
+    restart: unless-stopped
+
+    command:
+      redis-server --appendonly yes
+
+    volumes:
+      - redis_data:/data
+
+
+  api:
+    build: .
+    container_name: tender-api
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+    volumes:
+      - ./data:/app/data
+
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000"
+      ]
+
+
+  worker:
+    build: .
+    container_name: tender-worker
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+    volumes:
+      - ./data:/app/data
+
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.tasks.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=2"
+      ]
+
+
+  beat:
+    build: .
+    container_name: tender-beat
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    depends_on:
+      redis:
+        condition: service_started
+
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.tasks.celery_app",
+        "beat",
+        "--loglevel=INFO"
+      ]
+
+
+  browser:
+    build: .
+    container_name: tender-browser
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    volumes:
+      - ./data:/app/data
+
+    command:
+      [
+        "python",
+        "-m",
+        "playwright",
+        "install",
+        "--with-deps",
+        "chromium"
+      ]
+
+    profiles:
+      - browser-init
+
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+---
+
+# 3. `Dockerfile`
+
+```dockerfile id="73516"
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y \
+        curl \
+        gcc \
+        libpq-dev \
+        libxml2-dev \
+        libxslt1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN playwright install --with-deps chromium
+
+COPY . .
+
+RUN mkdir -p /app/data/documents
+
+CMD [
+    "uvicorn",
+    "app.main:app",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8000"
+]
+```
+
+---
+
+# 4. `requirements.txt`
+
+```text id="89144"
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+
+sqlalchemy==2.0.40
+asyncpg==0.30.0
+
+pydantic==2.11.3
+pydantic-settings==2.8.1
+
+httpx==0.28.1
+beautifulsoup4==4.13.3
+lxml==5.3.2
+
+celery==5.5.1
+redis==5.2.1
+
+aiogram==3.20.0
+
+playwright==1.51.0
+
+pymupdf==1.25.5
+python-docx==1.1.2
+openpyxl==3.1.5
+
+python-dateutil==2.9.0.post0
+
+pytest==8.3.5
+pytest-asyncio==0.26.0
+```
+
+---
+
+# 5. `.env.example`
+
+```dotenv id="62377"
+POSTGRES_DB=tenders
+POSTGRES_USER=tender
+POSTGRES_PASSWORD=CHANGE_ME
+
+DATABASE_URL=postgresql+asyncpg://tender:CHANGE_ME@postgres:5432/tenders
+
+REDIS_URL=redis://redis:6379/0
+
+API_PORT=8000
+
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# Monitoring
+COLLECT_INTERVAL_MINUTES=15
+
+# Search
+OKPD_PREFIX=85
+
+# Bootstrap
+INITIAL_LOOKBACK_DAYS=7
+
+# Documents
+DOWNLOAD_DOCUMENTS=true
+DOCUMENT_DIR=/app/data/documents
+
+# Browser
+HEADLESS=true
+BROWSER_TIMEOUT_MS=60000
+
+# Sources
+ENABLE_EIS=true
+ENABLE_FABRIKANT=true
+ENABLE_TEKTORG=true
+ENABLE_RTS=true
+
+FABRIKANT_URL=https://soap2.fabrikant.ru/223/catalog/procedure/published
+
+TEKTORG_URL=https://www.tektorg.ru/223-fz/procedures
+
+RTS_URL=https://www.rts-tender.ru/
+
+# Safety
+MAX_PAGES_PER_SOURCE=100
+REQUEST_DELAY_SECONDS=2
+```
+
+---
+
+# 6. Базовая модель
+
+`app/db/base.py`
+
+```python id="28614"
+from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    pass
+```
+
+---
+
+# 7. Модели
+
+`app/db/models.py`
+
+```python id="54071"
+from datetime import datetime
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
+
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .base import Base
+
+
+class Tender(Base):
+
+    __tablename__ = "tenders"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    law: Mapped[str] = mapped_column(
+        String(20),
+        default="223-ФЗ",
+        nullable=False,
+    )
+
+    notice_number: Mapped[str | None] = mapped_column(
+        String(255),
+    )
+
+    title: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    description: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+    customer_name: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+    customer_inn: Mapped[str | None] = mapped_column(
+        String(32),
+    )
+
+    okpd_code: Mapped[str | None] = mapped_column(
+        String(64),
+    )
+
+    okpd_name: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+    price: Mapped[float | None] = mapped_column(
+        Numeric(20, 2),
+    )
+
+    currency: Mapped[str | None] = mapped_column(
+        String(16),
+    )
+
+    region: Mapped[str | None] = mapped_column(
+        String(255),
+    )
+
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    deadline: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    status: Mapped[str | None] = mapped_column(
+        String(255),
+    )
+
+    match_type: Mapped[str | None] = mapped_column(
+        String(64),
+    )
+
+    canonical_url: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+    fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    sources = relationship(
+        "TenderSource",
+        back_populates="tender",
+        cascade="all, delete-orphan",
+    )
+
+    documents = relationship(
+        "Document",
+        back_populates="tender",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_tenders_notice",
+            "notice_number",
+        ),
+        Index(
+            "ix_tenders_okpd",
+            "okpd_code",
+        ),
+        Index(
+            "ix_tenders_deadline",
+            "deadline",
+        ),
+    )
+
+
+class TenderSource(Base):
+
+    __tablename__ = "tender_sources"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    tender_id: Mapped[int] = mapped_column(
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    source: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    external_id: Mapped[str | None] = mapped_column(
+        String(255),
+    )
+
+    url: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+    )
+
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+    )
+
+    tender = relationship(
+        "Tender",
+        back_populates="sources",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source",
+            "external_id",
+            name="uq_source_external",
+        ),
+    )
+
+
+class RawTender(Base):
+
+    __tablename__ = "raw_tenders"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    source: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    external_id: Mapped[str | None] = mapped_column(
+        String(255),
+    )
+
+    payload: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+    )
+
+    payload_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    collected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+    )
+
+
+class CollectorRun(Base):
+
+    __tablename__ = "collector_runs"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    source: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    received_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+    )
+
+    new_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+    )
+
+    error_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="RUNNING",
+    )
+
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+
+class Document(Base):
+
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    tender_id: Mapped[int] = mapped_column(
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    name: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    url: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    local_path: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+    mime_type: Mapped[str | None] = mapped_column(
+        String(255),
+    )
+
+    sha256: Mapped[str | None] = mapped_column(
+        String(64),
+    )
+
+    extracted_text: Mapped[str | None] = mapped_column(
+        Text,
+    )
+
+    downloaded: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+
+    tender = relationship(
+        "Tender",
+        back_populates="documents",
+    )
+```
+
+---
+
+# 8. Сессия
+
+`app/db/session.py`
+
+```python id="58103"
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from app.config import settings
+from .base import Base
+
+
+engine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
+
+SessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+async def init_db():
+
+    async with engine.begin() as conn:
+
+        await conn.run_sync(
+            Base.metadata.create_all
+        )
+```
+
+---
+
+# 9. Настройки
+
+`app/config.py`
+
+```python id="96318"
+from pydantic_settings import (
+    BaseSettings,
+    SettingsConfigDict,
+)
+
+
+class Settings(BaseSettings):
+
+    database_url: str
+    redis_url: str
+
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    collect_interval_minutes: int = 15
+
+    okpd_prefix: str = "85"
+
+    initial_lookback_days: int = 7
+
+    download_documents: bool = True
+    document_dir: str = "/app/data/documents"
+
+    headless: bool = True
+    browser_timeout_ms: int = 60000
+
+    enable_eis: bool = True
+    enable_fabrikant: bool = True
+    enable_tektorg: bool = True
+    enable_rts: bool = True
+
+    fabrikant_url: str
+
+    tektorg_url: str
+    rts_url: str
+
+    max_pages_per_source: int = 100
+    request_delay_seconds: float = 2
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+    )
+
+
+settings = Settings()
+```
+
+---
+
+# 10. Унифицированный TenderData
+
+`app/collectors/base.py`
+
+```python id="75012"
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+
+
+@dataclass
+class TenderData:
+
+    law: str = "223-ФЗ"
+
+    notice_number: str | None = None
+
+    title: str = ""
+
+    description: str | None = None
+
+    customer_name: str | None = None
+
+    customer_inn: str | None = None
+
+    okpd_code: str | None = None
+
+    okpd_name: str | None = None
+
+    price: Decimal | None = None
+
+    currency: str | None = None
+
+    region: str | None = None
+
+    published_at: datetime | None = None
+
+    deadline: datetime | None = None
+
+    status: str | None = None
+
+    source: str = ""
+
+    external_id: str | None = None
+
+    source_url: str | None = None
+
+    eis_url: str | None = None
+
+    documents: list[dict] | None = None
+
+
+class BaseCollector:
+
+    name = "base"
+
+    async def collect(self) -> list[TenderData]:
+        raise NotImplementedError
+
+    async def healthcheck(self) -> bool:
+        return True
+```
+
+---
+
+# 11. Фильтр образования
+
+`app/filters/education.py`
+
+```python id="52947"
+import re
+
+from app.collectors.base import TenderData
+
+
+KEYWORDS = (
+    "образователь",
+    "обучен",
+    "повышен квалификац",
+    "профессиональн переподготов",
+    "дополнительн образован",
+    "профессиональн обучен",
+    "дпо",
+    "семинар",
+    "тренинг",
+    "подготовк специалистов",
+)
+
+
+def okpd_match(code: str | None) -> bool:
+
+    if not code:
+        return False
+
+    normalized = code.strip()
+
+    return normalized == "85" or normalized.startswith("85.")
+
+
+def keyword_match(tender: TenderData) -> bool:
+
+    text = " ".join(
+        filter(
+            None,
+            [
+                tender.title,
+                tender.description,
+                tender.okpd_name,
+            ],
+        )
+    ).lower()
+
+    return any(
+        keyword in text
+        for keyword in KEYWORDS
+    )
+
+
+def classify(
+    tender: TenderData,
+) -> str | None:
+
+    by_okpd = okpd_match(
+        tender.okpd_code
+    )
+
+    by_text = keyword_match(
+        tender
+    )
+
+    if by_okpd and by_text:
+        return "OKPD+KEYWORD"
+
+    if by_okpd:
+        return "OKPD"
+
+    if by_text:
+        return "KEYWORD"
+
+    return None
+
+
+def is_candidate(
+    tender: TenderData,
+) -> bool:
+
+    return classify(tender) is not None
+```
+
+---
+
+# 12. Нормализация и fingerprint
+
+`app/parsers/common.py`
+
+```python id="69402"
+import hashlib
+import json
+import re
+
+from app.collectors.base import TenderData
+
+
+def clean_text(value: str | None) -> str | None:
+
+    if not value:
+        return None
+
+    return re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
+
+
+def fingerprint(
+    tender: TenderData,
+) -> str:
+
+    identity = {
+
+        "law": tender.law,
+
+        "notice_number":
+            clean_text(
+                tender.notice_number
+            ),
+
+        "customer_inn":
+            clean_text(
+                tender.customer_inn
+            ),
+
+        "title":
+            clean_text(
+                tender.title
+            ),
+
+    }
+
+    raw = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+```
+
+---
+
+# 13. Репозиторий
+
+`app/db/repository.py`
+
+```python id="82154"
+import hashlib
+import json
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+
+from app.collectors.base import TenderData
+from app.filters.education import classify
+
+from .models import (
+    RawTender,
+    Tender,
+    TenderSource,
+)
+
+
+def utcnow():
+
+    return datetime.now(timezone.utc)
+
+
+def payload_hash(payload):
+
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+    return hashlib.sha256(
+        raw.encode()
+    ).hexdigest()
+
+
+async def save_raw(
+    session,
+    source: str,
+    external_id: str | None,
+    payload: dict,
+):
+
+    item = RawTender(
+        source=source,
+        external_id=external_id,
+        payload=payload,
+        payload_hash=payload_hash(payload),
+    )
+
+    session.add(item)
+
+
+async def find_by_notice(
+    session,
+    notice_number,
+):
+
+    if not notice_number:
+        return None
+
+    result = await session.execute(
+        select(Tender)
+        .where(
+            Tender.notice_number
+            == notice_number
+        )
+        .limit(1)
+    )
+
+    return result.scalar_one_or_none()
+
+
+async def find_source(
+    session,
+    source,
+    external_id,
+):
+
+    if not external_id:
+        return None
+
+    result = await session.execute(
+        select(TenderSource)
+        .where(
+            TenderSource.source
+            == source,
+            TenderSource.external_id
+            == external_id,
+        )
+        .limit(1)
+    )
+
+    return result.scalar_one_or_none()
+
+
+async def save_tender(
+    session,
+    data: TenderData,
+    fp: str,
+):
+
+    match_type = classify(data)
+
+    if not match_type:
+        return None, False
+
+    tender = await find_by_notice(
+        session,
+        data.notice_number,
+    )
+
+    created = False
+
+    if tender is None:
+
+        tender = Tender(
+            law=data.law,
+            notice_number=data.notice_number,
+            title=data.title,
+            description=data.description,
+            customer_name=data.customer_name,
+            customer_inn=data.customer_inn,
+            okpd_code=data.okpd_code,
+            okpd_name=data.okpd_name,
+            price=data.price,
+            currency=data.currency,
+            region=data.region,
+            published_at=data.published_at,
+            deadline=data.deadline,
+            status=data.status,
+            match_type=match_type,
+            canonical_url=(
+                data.eis_url
+                or data.source_url
+            ),
+            fingerprint=fp,
+        )
+
+        session.add(tender)
+
+        await session.flush()
+
+        created = True
+
+    else:
+
+        changed = (
+            tender.fingerprint != fp
+        )
+
+        tender.title = data.title
+        tender.description = data.description
+        tender.customer_name = data.customer_name
+        tender.customer_inn = data.customer_inn
+        tender.okpd_code = data.okpd_code
+        tender.okpd_name = data.okpd_name
+        tender.price = data.price
+        tender.currency = data.currency
+        tender.region = data.region
+        tender.published_at = data.published_at
+        tender.deadline = data.deadline
+        tender.status = data.status
+        tender.match_type = match_type
+        tender.fingerprint = fp
+        tender.updated_at = utcnow()
+
+        created = changed
+
+    source = await find_source(
+        session,
+        data.source,
+        data.external_id
+        or data.notice_number,
+    )
+
+    if source is None:
+
+        source = TenderSource(
+            tender_id=tender.id,
+            source=data.source,
+            external_id=(
+                data.external_id
+                or data.notice_number
+            ),
+            url=data.source_url,
+        )
+
+        session.add(source)
+
+    else:
+
+        source.last_seen = utcnow()
+        source.url = data.source_url
+
+    await session.commit()
+
+    return tender, created
+```
+
+---
+
+# 14. ФАБРИКАНТ — реальный collector
+
+Публичный реестр ФАБРИКАНТа сейчас действительно доступен и содержит нужные нам поля; поэтому его можно использовать как первый полноценный browser collector. ([Фабрикант][1])
+
+`app/collectors/fabrikant.py`
+
+```python id="21763"
+import asyncio
+import re
+from decimal import Decimal
+
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+
+from app.config import settings
+
+from .base import (
+    BaseCollector,
+    TenderData,
+)
+
+
+class FabrikantCollector(
+    BaseCollector
+):
+
+    name = "fabrikant"
+
+    async def healthcheck(self):
+
+        async with async_playwright() as p:
+
+            browser = await p.chromium.launch(
+                headless=True
+            )
+
+            page = await browser.new_page()
+
+            try:
+
+                response = await page.goto(
+                    settings.fabrikant_url,
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
+                return (
+                    response is not None
+                    and response.status < 500
+                )
+
+            except Exception:
+
+                return False
+
+            finally:
+
+                await browser.close()
+
+    async def collect(self):
+
+        async with async_playwright() as p:
+
+            browser = await p.chromium.launch(
+                headless=settings.headless
+            )
+
+            page = await browser.new_page(
+                viewport={
+                    "width": 1440,
+                    "height": 1000,
+                }
+            )
+
+            result = []
+
+            try:
+
+                await page.goto(
+                    settings.fabrikant_url,
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
+                for _ in range(
+                    settings.max_pages_per_source
+                ):
+
+                    html = await page.content()
+
+                    items = self.parse(
+                        html
+                    )
+
+                    result.extend(items)
+
+                    next_link = await self.next_page(
+                        page
+                    )
+
+                    if not next_link:
+                        break
+
+                    await page.goto(
+                        next_link,
+                        wait_until="domcontentloaded",
+                        timeout=settings.browser_timeout_ms,
+                    )
+
+                    await asyncio.sleep(
+                        settings.request_delay_seconds
+                    )
+
+            finally:
+
+                await browser.close()
+
+            return result
+
+    async def next_page(self, page):
+
+        links = await page.locator(
+            "a"
+        ).all()
+
+        current = page.url
+
+        for link in links:
+
+            text = (
+                await link.inner_text()
+            ).strip().lower()
+
+            href = await link.get_attribute(
+                "href"
+            )
+
+            if (
+                href
+                and (
+                    text == ">"
+                    or "след" in text
+                    or "next" in text
+                )
+            ):
+
+                if href.startswith("/"):
+                    return (
+                        "https://soap2.fabrikant.ru"
+                        + href
+                    )
+
+                return href
+
+        match = re.search(
+            r"page=(\d+)",
+            current,
+        )
+
+        if match:
+
+            page_no = int(
+                match.group(1)
+            )
+
+            next_no = page_no + 1
+
+        else:
+
+            next_no = 2
+
+        if "?" in current:
+
+            return re.sub(
+                r"page=\d+",
+                f"page={next_no}",
+                current,
+            )
+
+        return (
+            current
+            + f"?page={next_no}"
+        )
+
+    def parse(self, html):
+
+        soup = BeautifulSoup(
+            html,
+            "lxml",
+        )
+
+        result = []
+
+        for row in soup.select(
+            "tr"
+        ):
+
+            cells = [
+                cell.get_text(
+                    " ",
+                    strip=True,
+                )
+                for cell in row.select(
+                    "td"
+                )
+            ]
+
+            if len(cells) < 5:
+                continue
+
+            text = " ".join(cells)
+
+            match = re.search(
+                r"\b(3\d{10,})\b",
+                text,
+            )
+
+            if not match:
+                continue
+
+            notice = match.group(1)
+
+            title = cells[1]
+
+            price = self.parse_price(
+                cells[2]
+            )
+
+            customer = (
+                cells[4]
+                if len(cells) > 4
+                else None
+            )
+
+            published = (
+                cells[5]
+                if len(cells) > 5
+                else None
+            )
+
+            deadline = (
+                cells[6]
+                if len(cells) > 6
+                else None
+            )
+
+            status = (
+                cells[9]
+                if len(cells) > 9
+                else None
+            )
+
+            result.append(
+                TenderData(
+                    law="223-ФЗ",
+                    notice_number=notice,
+                    title=title,
+                    customer_name=customer,
+                    price=price,
+                    published_at=self.parse_date(
+                        published
+                    ),
+                    deadline=self.parse_date(
+                        deadline
+                    ),
+                    status=status,
+                    source=self.name,
+                    external_id=notice,
+                )
+            )
+
+        return result
+
+    @staticmethod
+    def parse_price(value):
+
+        if not value:
+            return None
+
+        match = re.search(
+            r"([\d\s]+[.,]\d+)",
+            value,
+        )
+
+        if not match:
+            return None
+
+        raw = (
+            match.group(1)
+            .replace(" ", "")
+            .replace(",", ".")
+        )
+
+        try:
+            return Decimal(raw)
+
+        except Exception:
+            return None
+
+    @staticmethod
+    def parse_date(value):
+
+        if not value:
+            return None
+
+        from dateutil import parser
+
+        try:
+            return parser.parse(
+                value,
+                dayfirst=True,
+            )
+
+        except Exception:
+            return None
+```
+
+**Важно:** parser специально изолирован от базы. Если ФАБРИКАНТ изменит HTML, исправляется только этот адаптер.
+
+---
+
+# 15. ТЭК-Торг
+
+У ТЭК-Торга есть отдельная секция 223-ФЗ, а сама площадка публикует официальный регламент работы в этой секции. ([Tektorg][2])
+
+Я не буду подставлять не подтверждённый API. Поэтому:
+
+`app/collectors/tektorg.py`
+
+```python id="90317"
+from playwright.async_api import async_playwright
+
+from app.config import settings
+
+from .base import (
+    BaseCollector,
+    TenderData,
+)
+
+
+class TektorgCollector(
+    BaseCollector
+):
+
+    name = "tektorg"
+
+    async def healthcheck(self):
+
+        async with async_playwright() as p:
+
+            browser = await p.chromium.launch(
+                headless=True
+            )
+
+            page = await browser.new_page()
+
+            try:
+
+                response = await page.goto(
+                    settings.tektorg_url,
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
+                return bool(
+                    response
+                    and response.status < 500
+                )
+
+            except Exception:
+
+                return False
+
+            finally:
+
+                await browser.close()
+
+    async def collect(self):
+
+        async with async_playwright() as p:
+
+            browser = await p.chromium.launch(
+                headless=settings.headless
+            )
+
+            page = await browser.new_page()
+
+            try:
+
+                await page.goto(
+                    settings.tektorg_url,
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
+                # Адаптер намеренно не содержит
+                # выдуманного API.
+                #
+                # Конкретный парсер процедуры
+                # изолирован здесь.
+
+                return []
+
+            finally:
+
+                await browser.close()
+```
+
+Это **не означает, что источник выключен навсегда**. Он будет возвращать пустой результат до настройки актуальных селекторов/endpoint после конкретной проверки интерфейса.
+
+---
+
+# 16. РТС
+
+`app/collectors/rts.py`
+
+```python id="76142"
+from playwright.async_api import async_playwright
+
+from app.config import settings
+
+from .base import BaseCollector
+
+
+class RtsCollector(
+    BaseCollector
+):
+
+    name = "rts"
+
+    async def healthcheck(self):
+
+        async with async_playwright() as p:
+
+            browser = await p.chromium.launch(
+                headless=True
+            )
+
+            page = await browser.new_page()
+
+            try:
+
+                response = await page.goto(
+                    settings.rts_url,
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
+                return bool(
+                    response
+                    and response.status < 500
+                )
+
+            except Exception:
+
+                return False
+
+            finally:
+
+                await browser.close()
+
+    async def collect(self):
+
+        async with async_playwright() as p:
+
+            browser = await p.chromium.launch(
+                headless=settings.headless
+            )
+
+            page = await browser.new_page()
+
+            try:
+
+                await page.goto(
+                    settings.rts_url,
+                    wait_until="domcontentloaded",
+                    timeout=settings.browser_timeout_ms,
+                )
+
+                return []
+
+            finally:
+
+                await browser.close()
+```
+
+---
+
+# 17. ЕИС
+
+ЕИС тоже оставляем отдельным адаптером, а не пытаемся сделать хрупкий scraping главной страницы.
+
+`app/collectors/eis.py`
+
+```python id="11835"
+from .base import (
+    BaseCollector,
+    TenderData,
+)
+
+
+class EisCollector(
+    BaseCollector
+):
+
+    name = "eis"
+
+    async def healthcheck(self):
+
+        # Здесь подключается актуальный
+        # машиночитаемый контур ЕИС.
+        #
+        # Не используем старый FTP,
+        # не используем HTML-поиск сайта.
+
+        return False
+
+    async def collect(self):
+
+        return []
+```
+
+То есть в этом репозитории я **не стану лгать**, что ЕИС уже подключён, если конкретный production endpoint не был проверен.
+
+---
+
+# 18. Manager
+
+`app/collectors/manager.py`
+
+```python id="58392"
+import logging
+from datetime import datetime, timezone
+
+from app.db.models import CollectorRun
+from app.db.repository import (
+    save_raw,
+    save_tender,
+)
+from app.parsers.common import fingerprint
+
+
+logger = logging.getLogger(
+    "collector.manager"
+)
+
+
+class CollectorManager:
+
+    def __init__(self, session):
+
+        self.session = session
+
+    async def run(self, collector):
+
+        started = datetime.now(
+            timezone.utc
+        )
+
+        run = CollectorRun(
+            source=collector.name,
+            started_at=started,
+            status="RUNNING",
+        )
+
+        self.session.add(run)
+
+        await self.session.commit()
+
+        try:
+
+            items = await collector.collect()
+
+            run.received_count = len(
+                items
+            )
+
+            for item in items:
+
+                payload = {
+                    "notice_number":
+                        item.notice_number,
+                    "title":
+                        item.title,
+                    "okpd":
+                        item.okpd_code,
+                    "source":
+                        item.source,
+                }
+
+                await save_raw(
+                    self.session,
+                    item.source,
+                    item.external_id,
+                    payload,
+                )
+
+                fp = fingerprint(item)
+
+                tender, created = (
+                    await save_tender(
+                        self.session,
+                        item,
+                        fp,
+                    )
+                )
+
+                if created:
+
+                    run.new_count += 1
+
+            run.status = "OK"
+
+        except Exception as exc:
+
+            logger.exception(
+                "Collector failed: %s",
+                collector.name,
+            )
+
+            run.status = "ERROR"
+            run.error_count += 1
+            run.error_message = str(
+                exc
+            )
+
+        finally:
+
+            run.finished_at = (
+                datetime.now(
+                    timezone.utc
+                )
+            )
+
+            await self.session.commit()
+```
+
+---
+
+# 19. Telegram
+
+`app/notifications/telegram.py`
+
+```python id="31864"
+from aiogram import Bot
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
+from app.config import settings
+
+
+async def send_tender(tender):
+
+    if not settings.telegram_bot_token:
+        return
+
+    if not settings.telegram_chat_id:
+        return
+
+    bot = Bot(
+        token=settings.telegram_bot_token
+    )
+
+    text = f"""
+🆕 <b>Новая закупка</b>
+
+<b>223-ФЗ</b>
+
+<b>{tender.title}</b>
+
+ОКПД2: {tender.okpd_code or "не указан"}
+
+Заказчик:
+{tender.customer_name or "—"}
+
+НМЦ:
+{tender.price or "не указана"}
+
+Регион:
+{tender.region or "—"}
+
+Подача до:
+{tender.deadline or "—"}
+
+Источник:
+{tender.sources[0].source if tender.sources else "—"}
+
+№:
+{tender.notice_number or "—"}
+""".strip()
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔗 Открыть",
+                    url=tender.canonical_url
+                    or "https://zakupki.gov.ru/",
+                )
+            ]
+        ]
+    )
+
+    try:
+
+        await bot.send_message(
+            chat_id=settings.telegram_chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    finally:
+
+        await bot.session.close()
+```
+
+---
+
+# 20. Celery
+
+`app/workers/tasks.py`
+
+```python id="45291"
+import asyncio
+
+from celery import Celery
+
+from app.config import settings
+from app.db.session import SessionLocal
+from app.collectors.manager import CollectorManager
+
+from app.collectors.eis import EisCollector
+from app.collectors.fabrikant import (
+    FabrikantCollector,
+)
+from app.collectors.tektorg import (
+    TektorgCollector,
+)
+from app.collectors.rts import (
+    RtsCollector,
+)
+
+
+celery_app = Celery(
+    "tender_monitor",
+    broker=settings.redis_url,
+    backend=settings.redis_url,
+)
+
+
+celery_app.conf.beat_schedule = {
+    "collect-tenders": {
+        "task":
+            "app.workers.tasks.collect_all",
+        "schedule":
+            settings.collect_interval_minutes * 60,
+    },
+}
+
+
+def get_collectors():
+
+    result = []
+
+    if settings.enable_eis:
+        result.append(
+            EisCollector()
+        )
+
+    if settings.enable_fabrikant:
+        result.append(
+            FabrikantCollector()
+        )
+
+    if settings.enable_tektorg:
+        result.append(
+            TektorgCollector()
+        )
+
+    if settings.enable_rts:
+        result.append(
+            RtsCollector()
+        )
+
+    return result
+
+
+async def collect():
+
+    async with SessionLocal() as session:
+
+        manager = CollectorManager(
+            session
+        )
+
+        for collector in get_collectors():
+
+            await manager.run(
+                collector
+            )
+
+
+@celery_app.task
+def collect_all():
+
+    asyncio.run(
+        collect()
+    )
+```
+
+---
+
+# 21. FastAPI
+
+`app/main.py`
+
+```python id="68143"
+from fastapi import FastAPI
+
+from app.db.session import init_db
+
+
+app = FastAPI(
+    title="223-FZ Education Tender Monitor",
+    version="1.0.0",
+)
+
+
+@app.on_event("startup")
+async def startup():
+
+    await init_db()
+
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "ok",
+        "service": "tender-monitor",
+    }
+
+
+@app.get("/api/tenders")
+async def get_tenders(
+    limit: int = 100,
+):
+
+    from sqlalchemy import select
+
+    from app.db.models import Tender
+    from app.db.session import SessionLocal
+
+    async with SessionLocal() as session:
+
+        result = await session.execute(
+            select(Tender)
+            .order_by(
+                Tender.created_at.desc()
+            )
+            .limit(
+                min(limit, 500)
+            )
+        )
+
+        tenders = result.scalars().all()
+
+        return [
+            {
+                "id": t.id,
+                "notice":
+                    t.notice_number,
+                "title":
+                    t.title,
+                "customer":
+                    t.customer_name,
+                "okpd":
+                    t.okpd_code,
+                "price":
+                    str(t.price)
+                    if t.price is not None
+                    else None,
+                "region":
+                    t.region,
+                "deadline":
+                    t.deadline,
+                "status":
+                    t.status,
+                "source":
+                    t.canonical_url,
+            }
+            for t in tenders
+        ]
+```
+
+---
+
+# 22. Тест фильтра
+
+`tests/test_filter.py`
+
+```python id="94163"
+from app.collectors.base import TenderData
+from app.filters.education import (
+    classify,
+    is_candidate,
+)
+
+
+def test_okpd_85():
+
+    tender = TenderData(
+        title="Любая услуга",
+        okpd_code="85.42.19",
+    )
+
+    assert is_candidate(tender)
+    assert classify(tender) == "OKPD"
+
+
+def test_keyword():
+
+    tender = TenderData(
+        title="Проведение обучения работников",
+        okpd_code="62.01",
+    )
+
+    assert is_candidate(tender)
+    assert classify(tender) == "KEYWORD"
+
+
+def test_both():
+
+    tender = TenderData(
+        title="Обучение работников",
+        okpd_code="85.42.19",
+    )
+
+    assert classify(tender) == "OKPD+KEYWORD"
+```
+
+---
+
+# 23. Makefile
+
+```makefile id="38519"
+up:
+	docker compose up -d
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f
+
+worker:
+	docker compose logs -f worker
+
+beat:
+	docker compose logs -f beat
+
+test:
+	docker compose run --rm api pytest
+
+shell:
+	docker compose exec api bash
+
+db:
+	docker compose exec postgres psql -U tender -d tenders
+
+restart:
+	docker compose restart
+```
+
+---
+
+# 24. README
+
+```markdown id="61470"
+# 223-FZ Education Tender Monitor
+
+Мониторинг закупок по 223-ФЗ.
+
+Основной критерий:
+
+OKPD2 = 85.*
+
+Дополнительный критерий:
+
+образовательные услуги / обучение / ДПО /
+повышение квалификации / переподготовка и т.д.
+
+## Запуск
+
+Скопировать:
+
+.env.example -> .env
+
+Заполнить:
+
+POSTGRES_PASSWORD
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+
+Запустить:
+
+docker compose build
+docker compose up -d
+
+Проверить:
+
+curl http://localhost:8000/health
+
+Посмотреть логи:
+
+docker compose logs -f worker
+
+## Telegram
+
+Создать бота через BotFather.
+
+Получить:
+
+TELEGRAM_BOT_TOKEN
+
+Затем указать:
+
+TELEGRAM_CHAT_ID
+
+## Архитектура
+
+ЕИС
+ФАБРИКАНТ
+ТЭК-Торг
+РТС-Тендер
+
+↓
+
+Collectors
+
+↓
+
+Raw data
+
+↓
+
+Normalization
+
+↓
+
+Deduplication
+
+↓
+
+223-ФЗ / ОКПД2 85
+
+↓
+
+PostgreSQL
+
+↓
+
+Telegram
+```
+
+---
+
+# 25. Запуск
+
+```bash
+cp .env.example .env
+```
+
+Отредактировать:
+
+```dotenv
+POSTGRES_PASSWORD=сильный_пароль
+
+TELEGRAM_BOT_TOKEN=токен_бота
+TELEGRAM_CHAT_ID=id_чата
+```
+
+Затем:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+Проверка:
+
+```bash
+docker compose ps
+```
+
+и:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Должно вернуть:
+
+```json
+{
+  "status": "ok",
+  "service": "tender-monitor"
+}
+```
+
+---
+
+# Но есть принципиально важная граница
+
+Вот здесь я хочу быть максимально честным.
+
+**Этот код — полноценный каркас production-сервиса, но я не стану называть его полностью боевым мониторингом всех четырёх источников.**
+
+Почему:
+
+* ФАБРИКАНТ — публичный collector можно реализовать непосредственно по доступному реестру; это подтверждается текущей страницей реестра. ([Фабрикант][1])
+* ТЭК-Торг — публичная инфраструктура есть, а официальные документы подтверждают работу секции 223-ФЗ, но стабильный массовый публичный API для нашего сценария я не буду выдумывать. ([Текторг][3])
+* РТС — аналогично: публичный поиск существует, но конкретный механизм массовой автоматизированной выборки нужно привязать к актуальному интерфейсу, а не придумывать endpoint.
+* ЕИС — это отдельная машиночитаемая интеграция, которую нужно привязать к актуальному интерфейсу/схемам ЕИС, а не к HTML сайта.
+
+Поэтому **пустые `EisCollector`, `TektorgCollector` и `RtsCollector` в этом варианте — намеренная защита от ложного ощущения, что мониторинг уже получает реальные данные**.
+
+---
+
+## Что я считаю правильным следующим production-шагом
+
+После запуска этого репозитория я бы не добавлял AI.
+
+Сначала:
+
+```text
+1. ЕИС
+   ↓
+2. ФАБРИКАНТ
+   ↓
+3. ТЭК-Торг
+   ↓
+4. РТС
+   ↓
+5. 7 дней параллельного сравнения
+   ↓
+6. Проверка пропусков
+   ↓
+7. Только потом AI
+```
+
+Причём ФАБРИКАНТ особенно полезен для первого этапа: его публичная документация подтверждает, что при интеграции с ООС процедура получает номер закупки ООС, а посетитель может знакомиться с содержанием извещения и требованиями документации. ([Fabrikant][4])
+
+**Именно после проверки полноты я бы добавил второй слой — поиск по документации.** Тогда система будет искать не только `85.*`, но и, например, закупку с ошибочным ОКПД2, где в ТЗ на 40 страницах написано «оказание услуг по повышению квалификации».
+
+Это уже будет версия **v1.1**, и она даст намного больше пользы, чем раннее внедрение AI.
+
+[1]: https://soap2.fabrikant.ru/223/catalog/procedure/finished?dir=desc&order=requestReviewEndDateTime&utm_source=chatgpt.com "Электронная торговая площадка Фабрикант"
+[2]: https://bonus223.tektorg.ru/?utm_source=chatgpt.com "Программа лояльности ТЭК-Бонус для заказчиков 223-ФЗ"
+[3]: https://www.tektorg.ru/storage/files/shares/%D0%94%D0%BE%D0%BA%D1%83%D0%BC%D0%B5%D0%BD%D1%82%D1%8B/223-%D0%A4%D0%97%20%D0%B8%20%D0%9A%D0%BE%D0%BC%D0%BC%D0%B5%D1%80%D1%87%D0%B5%D1%81%D0%BA%D0%B8%D0%B5%20%D0%B7%D0%B0%D0%BA%D1%83%D0%BF%D0%BA%D0%B8/%D0%A0%D0%B5%D0%B3%D0%BB%D0%B0%D0%BC%D0%B5%D0%BD%D1%82%20%D1%80%D0%B0%D0%B1%D0%BE%D1%82%D1%8B%20%D0%BD%D0%B0%20%D1%8D%D0%BB%D0%B5%D0%BA%D1%82%D1%80%D0%BE%D0%BD%D0%BD%D0%BE%D0%B9%20%D0%BF%D0%BB%D0%BE%D1%89%D0%B0%D0%B4%D0%BA%D0%B5%20%D0%90%D0%9E%20%D0%A2%D0%AD%D0%9A-%D0%A2%D0%BE%D1%80%D0%B3%20%D0%B2%20%D1%81%D0%B5%D0%BA%D1%86%D0%B8%D0%B8%20223-%D0%A4%D0%97%20%D0%B8%20%D0%9A....pdf?utm_source=chatgpt.com "УТВЕРЖДЕН
+Генеральным директором
+АО «ТЭК-Торг»
+
+Вв"
+[4]: https://static.fabrikant.ru/files/work_rules_files/2374750.pdf?title=%D0%98%D0%BD%D1%82%D0%B5%D0%B3%D1%80%D0%B0%D1%86%D0%B8%D1%8F_%D1%81_%D0%9E%D0%9E%D0%A1.pdf&utm_source=chatgpt.com "Торговая система «Фабрикант»"

@@ -1,0 +1,122 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tender-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: tender-redis
+    restart: unless-stopped
+
+    command:
+      redis-server --appendonly yes
+
+    volumes:
+      - redis_data:/data
+
+
+  api:
+    build: .
+    container_name: tender-api
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+    volumes:
+      - ./data:/app/data
+
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000"
+      ]
+
+
+  worker:
+    build: .
+    container_name: tender-worker
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+    volumes:
+      - ./data:/app/data
+
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.tasks.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=2"
+      ]
+
+
+  beat:
+    build: .
+    container_name: tender-beat
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    depends_on:
+      redis:
+        condition: service_started
+
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.tasks.celery_app",
+        "beat",
+        "--loglevel=INFO"
+      ]
+
+
+volumes:
+  postgres_data:
+  redis_data:
